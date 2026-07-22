@@ -1,0 +1,7 @@
+streamlit>=1.38
+opencv-python-headless>=4.9
+numpy>=1.26
+streamlit-image-coordinates>=0.4.0
+
+# Optional (only if you fine-tune and use YoloBallDetector in ball_tracker.py):
+# ultralytics>=8.2
