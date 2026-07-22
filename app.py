@@ -154,15 +154,21 @@ def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
                 display_frame[yy, mx] = [255, 60, 60]
 
     st.caption("Tap the ball on the image. **Tapped the wrong spot? Just tap again** — the newest tap wins.")
-    # Key includes the frame index on purpose: streamlit_image_coordinates
-    # keeps returning its LAST value across reruns, so without this, moving
-    # the slider to a new frame (without clicking) would silently keep the
-    # old click's (x, y) but pair it with the new frame's index.
+    # streamlit_image_coordinates returns its last click value on EVERY
+    # rerun, not just the run where the click happened. So we must only
+    # act when the returned coordinate actually differs from the last one
+    # we handled -- otherwise "handle click -> rerun -> same coord returned
+    # -> handle again -> rerun ..." becomes an infinite loop (the flashing).
+    # We also do NOT call st.rerun() here: this is inside a fragment, which
+    # redraws itself after the handler runs, so the marker updates without
+    # a forced rerun.
     coords = streamlit_image_coordinates(display_frame, key=f"impact_click_{idx}")
     if coords is not None:
-        st.session_state.impact_frame = idx
-        st.session_state.impact_xy = to_source_xy((coords["x"], coords["y"]), scale)
-        st.rerun()  # redraw immediately so the marker moves to the new tap
+        this_click = (idx, coords["x"], coords["y"])
+        if st.session_state.get("_last_impact_click") != this_click:
+            st.session_state["_last_impact_click"] = this_click
+            st.session_state.impact_frame = idx
+            st.session_state.impact_xy = to_source_xy((coords["x"], coords["y"]), scale)
 
     if "impact_xy" in st.session_state:
         ix, iy = st.session_state.impact_xy
@@ -190,13 +196,16 @@ def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
         if "impact_xy" not in st.session_state:
             st.warning("Tap the ball's position on the image above first.")
         else:
+            st.info("⏳ Processing the full clip — this can take a minute or two on the hosted app. "
+                    "Please keep this tab open; it isn't frozen.")
             progress = st.progress(0.0, text="Tracking ball…")
             out_dir = tempfile.mkdtemp()
-            result = process_video_auto(
-                video_path, os.path.join(out_dir, "tracer_output.mp4"),
-                st.session_state.impact_frame, st.session_state.impact_xy, color_bgr,
-                progress_callback=lambda p: progress.progress(min(p, 1.0), text="Tracking ball…"),
-            )
+            with st.spinner("Tracking the ball and rendering the tracer…"):
+                result = process_video_auto(
+                    video_path, os.path.join(out_dir, "tracer_output.mp4"),
+                    st.session_state.impact_frame, st.session_state.impact_xy, color_bgr,
+                    progress_callback=lambda p: progress.progress(max(0.0, min(p, 1.0)), text="Tracking ball…"),
+                )
             if result["tracking_stopped"]:
                 st.session_state.path_so_far = result["path_so_far"]
                 st.session_state.stopped_at_frame = result["stopped_at_frame"]
@@ -283,16 +292,23 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
 
     coords = streamlit_image_coordinates(disp, key=f"click_{active}_{idx}")
     if coords is not None:
-        st.session_state[f"{active}_frame"] = idx
-        st.session_state[f"{active}_xy"] = to_source_xy((coords["x"], coords["y"]), scale)
-        # Auto-advance to the next unset point so the flow moves forward
-        # on its own after each tap, instead of leaving the person to
-        # figure out they need to switch a control.
-        for p in POINTS:
-            if f"{p}_xy" not in st.session_state:
-                st.session_state.manual_active_point = p
-                break
-        st.rerun()
+        this_click = (active, idx, coords["x"], coords["y"])
+        # Only act on a genuinely NEW click. The component re-returns its
+        # last value on every rerun, so without this guard the rerun below
+        # feeds straight back into another identical "click" -> infinite
+        # loop (the flashing). Guarding makes the auto-advance rerun fire
+        # exactly once per real tap.
+        if st.session_state.get("_last_manual_click") != this_click:
+            st.session_state["_last_manual_click"] = this_click
+            st.session_state[f"{active}_frame"] = idx
+            st.session_state[f"{active}_xy"] = to_source_xy((coords["x"], coords["y"]), scale)
+            # Auto-advance to the next unset point so the flow moves forward
+            # on its own after each tap.
+            for p in POINTS:
+                if f"{p}_xy" not in st.session_state:
+                    st.session_state.manual_active_point = p
+                    break
+            st.rerun()
 
     # Let the person jump back to re-set any already-placed point.
     set_points = [p for p in POINTS if f"{p}_xy" in st.session_state]

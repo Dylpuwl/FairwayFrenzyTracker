@@ -93,18 +93,24 @@ class TracerRenderer:
         return out
 
 
-def mux_audio(silent_video_path: str, source_with_audio_path: str, output_path: str, crf: int = 16) -> None:
+def mux_audio(silent_video_path: str, source_with_audio_path: str, output_path: str, crf: int = 20) -> None:
     """Stream-copies nothing on purpose: re-encodes video to libx264/yuv420p
     (Safari-safe) while pulling audio from the ORIGINAL source clip, trimmed
-    to the shorter of the two streams so nothing drifts out of sync."""
+    to the shorter of the two streams so nothing drifts out of sync.
+
+    Uses -preset veryfast (not medium): on the free hosted tier CPU is the
+    bottleneck, and veryfast cuts encode time a lot for a barely-perceptible
+    quality difference at this crf. crf 20 is still visually high quality.
+    -threads 0 lets x264 use all available cores."""
     cmd = [
         "ffmpeg", "-y",
         "-i", silent_video_path,
         "-i", source_with_audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
         "-pix_fmt", "yuv420p",
+        "-threads", "0",
         "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         output_path,
