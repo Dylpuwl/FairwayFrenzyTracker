@@ -322,11 +322,19 @@ if mode == "auto_pick_impact":
 # ---------------------------------------------------------- CONFIRM STOP
 elif mode == "confirm_stop":
     stopped_at = st.session_state.stopped_at_frame
+    meta = get_video_meta(st.session_state.video_path)
+    timestamp = stopped_at / meta["fps"] if meta["fps"] else 0.0
     st.warning(
-        f"Automatic tracking stopped at frame {stopped_at}. This can mean the ball simply "
-        f"left the frame or landed (normal end of shot), or that tracking lost it "
-        f"(clouds, motion blur, low contrast, etc)."
+        f"Automatic tracking stopped at frame {stopped_at} (about {timestamp:.1f} seconds into the clip). "
+        f"This can mean the ball simply left the frame or landed (normal end of shot), "
+        f"or that tracking lost it (clouds, motion blur, low contrast, etc)."
     )
+    # Show the actual frame so "frame 657" is something you can SEE, not
+    # just a number -- you can tell at a glance whether the ball had really
+    # left/landed there, or whether tracking lost it mid-flight.
+    if 0 <= stopped_at < len(frames):
+        st.image(frames[stopped_at], caption=f"This is frame {stopped_at} — where tracking stopped.",
+                 use_container_width=True)
     c1, c2 = st.columns(2)
     with c1:
         if st.button("✅ That's the end of the shot — finish"):

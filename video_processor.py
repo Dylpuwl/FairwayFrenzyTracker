@@ -181,7 +181,45 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
         else:
             speed = float(np.hypot(*tracker.current_velocity))
             search_radius = max(160.0, speed * 1.5)  # widen the window for genuinely fast shots
+            # During an active coasting gap (ball currently lost), keep the
+            # window from ballooning frame after frame -- an ever-growing
+            # radius is exactly what lets a far-off bright object (shirt,
+            # cloud) fall inside it and get grabbed. Cap it while coasting.
+            if gap_start is not None:
+                search_radius = min(search_radius, 200.0)
         measured_xy = detector.detect(frame, predicted_xy=predicted_xy, search_radius=search_radius)
+
+        # MOTION-CONSISTENCY GATE. A ball in flight moves in a consistent
+        # direction at a consistent-ish speed -- it cannot suddenly reverse
+        # or teleport. Once we have a real velocity estimate, reject any
+        # "detection" that would require exactly that kind of impossible
+        # jump. This is what stops the tracer from latching onto the
+        # golfer's white shirt/shoes or bright background objects (clouds,
+        # sand, markers) once the real ball is lost against the sky: those
+        # false candidates sit in a totally different direction from the
+        # ball's travel, so they fail the gate and we coast on physics
+        # instead of snapping to them. Only applied after a few real
+        # detections, so a genuine early trajectory can still establish
+        # itself freely.
+        if measured_xy is not None and last_good_velocity is not None and last_good_point is not None \
+                and tracker.consecutive_detections >= 3:
+            vx, vy = last_good_velocity
+            speed = float(np.hypot(vx, vy))
+            if speed > 2.0:  # only gate once the ball is actually moving
+                move_x = measured_xy[0] - last_good_point.x
+                move_y = measured_xy[1] - last_good_point.y
+                move_dist = float(np.hypot(move_x, move_y))
+                # Direction check: dot product of the candidate move against
+                # the established velocity. Negative => moving backwards.
+                if move_dist > 1.0:
+                    cos_angle = (move_x * vx + move_y * vy) / (move_dist * speed)
+                    # Speed check: the step shouldn't be wildly larger than
+                    # the established per-frame speed (allow generous 3x for
+                    # acceleration/blur, but not a teleport across the frame).
+                    too_reversed = cos_angle < -0.3          # more than ~107 deg off course
+                    too_fast = move_dist > max(speed * 3.0, 120.0)
+                    if too_reversed or too_fast:
+                        measured_xy = None  # treat as a miss -> coast on physics
 
         if measured_xy is not None:
             corrected_xy = tracker.correct(*measured_xy)
