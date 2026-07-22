@@ -310,6 +310,12 @@ def render_path_over_video(source_path: str, output_path: str, path: List[Option
     writer = _open_writer(tmp_silent_path, fps, (w, h))
     renderer = TracerRenderer((h, w, 3), color_bgr, thickness=thickness)
 
+    if not cap.isOpened():
+        raise IOError(
+            "Could not reopen the video for rendering. On the hosted app the uploaded "
+            "file can be cleared between steps — please re-upload the clip and try again."
+        )
+
     frame_idx = 0
     while True:
         ok, frame = cap.read()
@@ -324,6 +330,16 @@ def render_path_over_video(source_path: str, output_path: str, path: List[Option
 
     cap.release()
     writer.release()
+    if frame_idx == 0:
+        # No frames were written -> the silent file is empty and the mux
+        # would fail with a cryptic ffmpeg error right at the end (matching
+        # the "bar fills then crashes" symptom). Fail clearly instead.
+        if os.path.exists(tmp_silent_path):
+            os.remove(tmp_silent_path)
+        raise RuntimeError(
+            "No video frames could be read from the source, so the tracer video is empty. "
+            "This usually means the uploaded file was no longer available — please re-upload and retry."
+        )
     mux_audio(tmp_silent_path, source_path, output_path)
     os.remove(tmp_silent_path)
 

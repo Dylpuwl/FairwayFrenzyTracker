@@ -132,18 +132,49 @@ def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
     with col_next:
         st.button("▶", key="impact_next", on_click=_step_impact, args=(1,), width="stretch")
 
+    # Draw a marker on a copy of the preview at the currently-set position
+    # (if it's on this frame) so a misclick is immediately visible and you
+    # can just tap again to move it. Tapping always overwrites, so
+    # correcting a misclick is simply "tap the right spot."
+    display_frame = frames[idx]
+    if st.session_state.get("impact_frame") == idx and "impact_xy" in st.session_state:
+        import numpy as _np
+        display_frame = frames[idx].copy()
+        mx = int(st.session_state.impact_xy[0] * scale)
+        my = int(st.session_state.impact_xy[1] * scale)
+        # simple crosshair marker (no cv2 needed on the preview array)
+        h_p, w_p = display_frame.shape[:2]
+        for dx in range(-8, 9):
+            xx = mx + dx
+            if 0 <= xx < w_p and 0 <= my < h_p:
+                display_frame[my, xx] = [255, 60, 60]
+        for dy in range(-8, 9):
+            yy = my + dy
+            if 0 <= mx < w_p and 0 <= yy < h_p:
+                display_frame[yy, mx] = [255, 60, 60]
+
+    st.caption("Tap the ball on the image. **Tapped the wrong spot? Just tap again** — the newest tap wins.")
     # Key includes the frame index on purpose: streamlit_image_coordinates
     # keeps returning its LAST value across reruns, so without this, moving
     # the slider to a new frame (without clicking) would silently keep the
     # old click's (x, y) but pair it with the new frame's index.
-    coords = streamlit_image_coordinates(frames[idx], key=f"impact_click_{idx}")
+    coords = streamlit_image_coordinates(display_frame, key=f"impact_click_{idx}")
     if coords is not None:
         st.session_state.impact_frame = idx
         st.session_state.impact_xy = to_source_xy((coords["x"], coords["y"]), scale)
+        st.rerun()  # redraw immediately so the marker moves to the new tap
 
     if "impact_xy" in st.session_state:
         ix, iy = st.session_state.impact_xy
-        st.success(f"Impact set: frame {st.session_state.impact_frame} at ({ix:.0f}, {iy:.0f})")
+        col_ok, col_clear = st.columns([3, 1])
+        with col_ok:
+            st.success(f"Impact set: frame {st.session_state.impact_frame} at ({ix:.0f}, {iy:.0f})")
+        with col_clear:
+            if st.button("↺ Clear", key="clear_impact", width="stretch"):
+                del st.session_state["impact_xy"]
+                if "impact_frame" in st.session_state:
+                    del st.session_state["impact_frame"]
+                st.rerun()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -216,7 +247,7 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
                 col.caption(f"○ {p.title()}\n(not set)")
 
     st.caption(f"**Setting {active.title()}** — {HELP[active]}. "
-               f"Scrub to the right frame, then tap the ball on the image.")
+               f"Scrub to the right frame, then tap the ball. **Misclick? Just tap again.**")
 
     slider_key = f"slider_{active}"
     if slider_key not in st.session_state:
@@ -233,7 +264,24 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
     with col_next:
         st.button("▶", key=f"next_{active}", on_click=_step_point, args=(1,), width="stretch")
 
-    coords = streamlit_image_coordinates(frames[idx], key=f"click_{active}_{idx}")
+    # Show a marker where THIS point is currently set (if on this frame),
+    # so a misclick is visible and correcting it is just another tap.
+    disp = frames[idx]
+    if st.session_state.get(f"{active}_frame") == idx and f"{active}_xy" in st.session_state:
+        disp = frames[idx].copy()
+        mx = int(st.session_state[f"{active}_xy"][0] * scale)
+        my = int(st.session_state[f"{active}_xy"][1] * scale)
+        h_p, w_p = disp.shape[:2]
+        for dx in range(-8, 9):
+            xx = mx + dx
+            if 0 <= xx < w_p and 0 <= my < h_p:
+                disp[my, xx] = [255, 60, 60]
+        for dy in range(-8, 9):
+            yy = my + dy
+            if 0 <= mx < w_p and 0 <= yy < h_p:
+                disp[yy, mx] = [255, 60, 60]
+
+    coords = streamlit_image_coordinates(disp, key=f"click_{active}_{idx}")
     if coords is not None:
         st.session_state[f"{active}_frame"] = idx
         st.session_state[f"{active}_xy"] = to_source_xy((coords["x"], coords["y"]), scale)
@@ -244,7 +292,7 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
             if f"{p}_xy" not in st.session_state:
                 st.session_state.manual_active_point = p
                 break
-        st.rerun(scope="fragment")
+        st.rerun()
 
     # Let the person jump back to re-set any already-placed point.
     set_points = [p for p in POINTS if f"{p}_xy" in st.session_state]
@@ -255,7 +303,7 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
             with col:
                 if st.button(f"Edit {p.title()}", key=f"edit_{p}", width="stretch"):
                     st.session_state.manual_active_point = p
-                    st.rerun(scope="fragment")
+                    st.rerun()
 
     st.divider()
     ready = all(f"{p}_xy" in st.session_state for p in POINTS)
@@ -346,17 +394,25 @@ elif mode == "confirm_stop":
     st.markdown("**What would you like to do?**")
     if st.button("🎯 Estimate the rest of the flight (recommended)", type="primary",
                  disabled=not have_state):
-        progress = st.progress(0.0, text="Estimating flight path…")
-        out_dir = tempfile.mkdtemp()
-        out_path = os.path.join(out_dir, "tracer_output.mp4")
-        extrapolate_lost_flight(
-            st.session_state.video_path, out_path,
-            st.session_state.path_so_far, st.session_state.last_state, color_bgr,
-            progress_callback=lambda p: progress.progress(min(p, 1.0), text="Estimating flight path…"),
-        )
-        st.session_state.output_path = out_path
-        st.session_state.mode = "done"
-        st.rerun()
+        try:
+            progress = st.progress(0.0, text="Estimating flight path…")
+            out_dir = tempfile.mkdtemp()
+            out_path = os.path.join(out_dir, "tracer_output.mp4")
+            extrapolate_lost_flight(
+                st.session_state.video_path, out_path,
+                st.session_state.path_so_far, st.session_state.last_state, color_bgr,
+                progress_callback=lambda p: progress.progress(max(0.0, min(p, 1.0)),
+                                                              text="Estimating flight path…"),
+            )
+            st.session_state.output_path = out_path
+            st.session_state.mode = "done"
+            st.rerun()
+        except Exception as e:
+            # Surface the real reason in the UI instead of crashing to the
+            # opaque "Oh no" screen -- and offer the other paths so the run
+            # isn't a dead end.
+            st.error(f"Couldn't finish the estimate: {e}")
+            st.caption("You can still finish with one of the options below.")
     if not have_state:
         st.caption("Estimate unavailable — the ball was never tracked long enough to project a path. "
                    "Use manual mode below.")
