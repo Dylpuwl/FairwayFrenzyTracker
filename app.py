@@ -31,6 +31,7 @@ from video_processor import (
     render_path_over_video,
     freeze_path_from,
 )
+from impact_detection import detect_impact_frame
 
 st.set_page_config(page_title="Golf Shot Tracer", page_icon="🏌️", layout="centered")
 
@@ -47,6 +48,9 @@ st.markdown("""
         background-color: #2D5A3D; color: #EDF3EE;
     }
     .stButton>button:hover { background-color: #3E6A50; border-color: #4C8563; }
+    .stButton>button:disabled {
+        background-color: #1A2E22; color: #6F8A7A; border-color: #23402F; opacity: 0.6;
+    }
     div[data-testid="stImage"] img { border-radius: 10px; border: 1px solid #3E6A50; }
 </style>
 """, unsafe_allow_html=True)
@@ -88,6 +92,191 @@ def reset_state():
         del st.session_state[k]
 
 
+@st.fragment
+def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
+    """
+    Everything a person touches repeatedly while hunting for the exact
+    impact frame lives in here. Wrapped in @st.fragment so that dragging
+    the slider, tapping +/-, or tapping the ball only reruns THIS function
+    -- not the whole page -- which is what was causing the page to jump
+    back to the top on every single interaction. The two exceptions are
+    the action buttons at the bottom: those still call st.rerun() (full
+    scope, the default) because switching to a different step genuinely
+    does need the rest of the page to re-render.
+    """
+    with st.expander("▶ Watch the clip first (real playback, drag to scrub)"):
+        st.video(video_path)
+        st.caption("This player supports real scrubbing and sound — use it to get oriented "
+                   "(listen for the click of contact), then pinpoint the exact frame below.")
+
+    if "impact_slider" not in st.session_state:
+        suggested = st.session_state.get("suggested_impact_frame")
+        st.session_state.impact_slider = suggested if suggested is not None else n_frames // 4
+
+    if st.session_state.get("suggested_impact_frame") is not None:
+        st.caption("🔊 Jumped to the loudest, sharpest sound in the clip — usually the strike. "
+                   "Confirm it's the ball, and nudge with ◀ ▶ if it's off by a frame or two.")
+    else:
+        st.caption("No audio track found to estimate from — scrub manually below.")
+
+    def _step_impact(delta):
+        st.session_state.impact_slider = max(0, min(n_frames - 1, st.session_state.impact_slider + delta))
+
+    col_prev, col_slider, col_next = st.columns([1, 8, 1])
+    with col_prev:
+        st.button("◀", key="impact_prev", on_click=_step_impact, args=(-1,), use_container_width=True)
+    with col_slider:
+        idx = st.slider("Scrub to the impact frame", 0, n_frames - 1, key="impact_slider",
+                         label_visibility="collapsed")
+    with col_next:
+        st.button("▶", key="impact_next", on_click=_step_impact, args=(1,), use_container_width=True)
+
+    # Key includes the frame index on purpose: streamlit_image_coordinates
+    # keeps returning its LAST value across reruns, so without this, moving
+    # the slider to a new frame (without clicking) would silently keep the
+    # old click's (x, y) but pair it with the new frame's index.
+    coords = streamlit_image_coordinates(frames[idx], key=f"impact_click_{idx}")
+    if coords is not None:
+        st.session_state.impact_frame = idx
+        st.session_state.impact_xy = to_source_xy((coords["x"], coords["y"]), scale)
+
+    if "impact_xy" in st.session_state:
+        ix, iy = st.session_state.impact_xy
+        st.success(f"Impact set: frame {st.session_state.impact_frame} at ({ix:.0f}, {iy:.0f})")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        run_auto = st.button("▶ Track shot automatically", type="primary")
+    with c2:
+        skip_manual = st.button("Skip to manual mode")
+
+    if run_auto:
+        # No disabled= here on purpose -- a disabled button gives no
+        # feedback about WHY it won't respond, and can be easy to miss
+        # entirely depending on styling. An explicit message can't be
+        # ambiguous either way.
+        if "impact_xy" not in st.session_state:
+            st.warning("Tap the ball's position on the image above first.")
+        else:
+            progress = st.progress(0.0, text="Tracking ball…")
+            out_dir = tempfile.mkdtemp()
+            result = process_video_auto(
+                video_path, os.path.join(out_dir, "tracer_output.mp4"),
+                st.session_state.impact_frame, st.session_state.impact_xy, color_bgr,
+                progress_callback=lambda p: progress.progress(min(p, 1.0), text="Tracking ball…"),
+            )
+            if result["tracking_stopped"]:
+                st.session_state.path_so_far = result["path_so_far"]
+                st.session_state.stopped_at_frame = result["stopped_at_frame"]
+                st.session_state.mode = "confirm_stop"
+            else:
+                st.session_state.output_path = result["output_path"]
+                st.session_state.mode = "done"
+            st.rerun()
+
+    if skip_manual:
+        st.session_state.mode = "manual_pick_points"
+        st.rerun()
+
+
+@st.fragment
+def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
+    """
+    Rewritten to a clear one-point-at-a-time flow. The previous version
+    used a radio to switch between launch/apex/landing, but tapping only
+    recorded the CURRENTLY selected point and the Generate button just
+    silently didn't appear until all three happened to be set -- easy to
+    get stuck in, with no feedback about what was missing. Now each point
+    is set explicitly with its own button, a running checklist shows what's
+    done, and Generate is always visible (disabled with a reason until all
+    three are in).
+    """
+    POINTS = ["launch", "apex", "landing"]
+    HELP = {
+        "launch": "the ball at the moment it leaves the club (impact)",
+        "apex": "the highest point of the ball's flight",
+        "landing": "where the ball lands or leaves the frame",
+    }
+
+    if "manual_active_point" not in st.session_state:
+        st.session_state.manual_active_point = "launch"
+    active = st.session_state.manual_active_point
+
+    # Status checklist -- always visible so it's never unclear what's left.
+    cols = st.columns(3)
+    for col, p in zip(cols, POINTS):
+        with col:
+            if f"{p}_xy" in st.session_state:
+                col.success(f"✓ {p.title()}\nframe {st.session_state[f'{p}_frame']}")
+            elif p == active:
+                col.info(f"● {p.title()}\n(setting now)")
+            else:
+                col.caption(f"○ {p.title()}\n(not set)")
+
+    st.caption(f"**Setting {active.title()}** — {HELP[active]}. "
+               f"Scrub to the right frame, then tap the ball on the image.")
+
+    slider_key = f"slider_{active}"
+    if slider_key not in st.session_state:
+        st.session_state[slider_key] = st.session_state.get(f"{active}_frame", n_frames // 4)
+
+    def _step_point(delta):
+        st.session_state[slider_key] = max(0, min(n_frames - 1, st.session_state[slider_key] + delta))
+
+    col_prev, col_slider, col_next = st.columns([1, 8, 1])
+    with col_prev:
+        st.button("◀", key=f"prev_{active}", on_click=_step_point, args=(-1,), use_container_width=True)
+    with col_slider:
+        idx = st.slider("Scrub", 0, n_frames - 1, key=slider_key, label_visibility="collapsed")
+    with col_next:
+        st.button("▶", key=f"next_{active}", on_click=_step_point, args=(1,), use_container_width=True)
+
+    coords = streamlit_image_coordinates(frames[idx], key=f"click_{active}_{idx}")
+    if coords is not None:
+        st.session_state[f"{active}_frame"] = idx
+        st.session_state[f"{active}_xy"] = to_source_xy((coords["x"], coords["y"]), scale)
+        # Auto-advance to the next unset point so the flow moves forward
+        # on its own after each tap, instead of leaving the person to
+        # figure out they need to switch a control.
+        for p in POINTS:
+            if f"{p}_xy" not in st.session_state:
+                st.session_state.manual_active_point = p
+                break
+        st.rerun(scope="fragment")
+
+    # Let the person jump back to re-set any already-placed point.
+    set_points = [p for p in POINTS if f"{p}_xy" in st.session_state]
+    if set_points:
+        st.caption("Re-set a point:")
+        recols = st.columns(len(set_points))
+        for col, p in zip(recols, set_points):
+            with col:
+                if st.button(f"Edit {p.title()}", key=f"edit_{p}", use_container_width=True):
+                    st.session_state.manual_active_point = p
+                    st.rerun(scope="fragment")
+
+    st.divider()
+    ready = all(f"{p}_xy" in st.session_state for p in POINTS)
+    if not ready:
+        missing = [p.title() for p in POINTS if f"{p}_xy" not in st.session_state]
+        st.info(f"Still need: {', '.join(missing)}. Tap each on the image to set it.")
+    if st.button("▶ Generate tracer", type="primary", disabled=not ready):
+        progress = st.progress(0.0, text="Rendering tracer…")
+        out_dir = tempfile.mkdtemp()
+        out_path = os.path.join(out_dir, "tracer_output.mp4")
+        process_video_manual(
+            video_path, out_path,
+            launch=(st.session_state["launch_frame"], st.session_state["launch_xy"]),
+            apex=(st.session_state["apex_frame"], st.session_state["apex_xy"]),
+            landing=(st.session_state["landing_frame"], st.session_state["landing_xy"]),
+            color_bgr=color_bgr,
+            progress_callback=lambda p: progress.progress(min(p, 1.0), text="Rendering tracer…"),
+        )
+        st.session_state.output_path = out_path
+        st.session_state.mode = "done"
+        st.rerun()  # full-scope: leaving manual mode needs the whole page
+
+
 st.title("🏌️ Golf Shot Tracer")
 st.caption("Upload a normal-speed iPhone clip (30/60 fps) — no slow-mo needed. "
            "Best results with the camera on a tripod; handheld footage may reduce tracking accuracy.")
@@ -108,8 +297,11 @@ if st.session_state.get("uploaded_name") != uploaded.name:
     st.session_state.uploaded_name = uploaded.name
     with st.spinner("Decoding preview…"):
         frames, scale = extract_preview_frames(video_path)
+        meta = get_video_meta(video_path)
+        suggested = detect_impact_frame(video_path, meta["fps"], len(frames))
     st.session_state.preview_frames = frames
     st.session_state.preview_scale = scale
+    st.session_state.suggested_impact_frame = suggested
     st.session_state.mode = "auto_pick_impact"
 
 frames = st.session_state.preview_frames
@@ -125,48 +317,7 @@ mode = st.session_state.mode
 # ---------------------------------------------------------------- STEP 1
 if mode == "auto_pick_impact":
     st.subheader("Step 1 — Tap the ball at the moment of impact")
-    idx = st.slider("Scrub to the impact frame", 0, n_frames - 1, n_frames // 4, key="impact_slider")
-
-    # Key includes the frame index on purpose: streamlit_image_coordinates
-    # keeps returning its LAST value across reruns, so without this, moving
-    # the slider to a new frame (without clicking) would silently keep the
-    # old click's (x, y) but pair it with the new frame's index.
-    coords = streamlit_image_coordinates(frames[idx], key=f"impact_click_{idx}")
-    if coords is not None:
-        st.session_state.impact_frame = idx
-        st.session_state.impact_xy = to_source_xy((coords["x"], coords["y"]), scale)
-
-    if "impact_xy" in st.session_state:
-        ix, iy = st.session_state.impact_xy
-        st.success(f"Impact set: frame {st.session_state.impact_frame} at ({ix:.0f}, {iy:.0f})")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        run_auto = st.button("▶ Track shot automatically", type="primary",
-                              disabled="impact_xy" not in st.session_state)
-    with c2:
-        skip_manual = st.button("Skip to manual mode")
-
-    if run_auto:
-        progress = st.progress(0.0, text="Tracking ball…")
-        out_dir = tempfile.mkdtemp()
-        result = process_video_auto(
-            st.session_state.video_path, os.path.join(out_dir, "tracer_output.mp4"),
-            st.session_state.impact_frame, st.session_state.impact_xy, color_bgr,
-            progress_callback=lambda p: progress.progress(min(p, 1.0), text="Tracking ball…"),
-        )
-        if result["tracking_stopped"]:
-            st.session_state.path_so_far = result["path_so_far"]
-            st.session_state.stopped_at_frame = result["stopped_at_frame"]
-            st.session_state.mode = "confirm_stop"
-        else:
-            st.session_state.output_path = result["output_path"]
-            st.session_state.mode = "done"
-        st.rerun()
-
-    if skip_manual:
-        st.session_state.mode = "manual_pick_points"
-        st.rerun()
+    impact_picker_fragment(st.session_state.video_path, frames, scale, n_frames, color_bgr)
 
 # ---------------------------------------------------------- CONFIRM STOP
 elif mode == "confirm_stop":
@@ -198,38 +349,7 @@ elif mode == "confirm_stop":
 # --------------------------------------------------------- MANUAL MODE
 elif mode == "manual_pick_points":
     st.subheader("Tap launch, apex, and landing")
-    st.caption("Scrub to the right frame for each point, then tap the ball's position on the image.")
-    point_key = st.radio("Which point are you setting?", ["launch", "apex", "landing"],
-                          horizontal=True, format_func=str.title)
-    default_idx = st.session_state.get(f"{point_key}_frame", n_frames // 4)
-    idx = st.slider("Scrub to the right frame", 0, n_frames - 1, default_idx, key=f"slider_{point_key}")
-
-    coords = streamlit_image_coordinates(frames[idx], key=f"click_{point_key}_{idx}")
-    if coords is not None:
-        st.session_state[f"{point_key}_frame"] = idx
-        st.session_state[f"{point_key}_xy"] = to_source_xy((coords["x"], coords["y"]), scale)
-
-    for p in ["launch", "apex", "landing"]:
-        if f"{p}_xy" in st.session_state:
-            px, py = st.session_state[f"{p}_xy"]
-            st.caption(f"{p.title()}: frame {st.session_state[f'{p}_frame']}, ({px:.0f}, {py:.0f})")
-
-    ready = all(f"{p}_xy" in st.session_state for p in ["launch", "apex", "landing"])
-    if ready and st.button("▶ Generate tracer", type="primary"):
-        progress = st.progress(0.0, text="Rendering tracer…")
-        out_dir = tempfile.mkdtemp()
-        out_path = os.path.join(out_dir, "tracer_output.mp4")
-        process_video_manual(
-            st.session_state.video_path, out_path,
-            launch=(st.session_state["launch_frame"], st.session_state["launch_xy"]),
-            apex=(st.session_state["apex_frame"], st.session_state["apex_xy"]),
-            landing=(st.session_state["landing_frame"], st.session_state["landing_xy"]),
-            color_bgr=color_bgr,
-            progress_callback=lambda p: progress.progress(min(p, 1.0), text="Rendering tracer…"),
-        )
-        st.session_state.output_path = out_path
-        st.session_state.mode = "done"
-        st.rerun()
+    manual_picker_fragment(frames, scale, n_frames, color_bgr, st.session_state.video_path)
 
 # --------------------------------------------------------------- DONE
 elif mode == "done":

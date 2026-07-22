@@ -42,7 +42,6 @@ from ball_tracker import BallDetector, KalmanBallTracker
 from physics_model import Point2D, ProjectileGapFiller, ManualBezierFallback
 
 MAX_COAST_FRAMES = 45              # ~0.75-1.5s depending on fps before we give up on a gap
-MIN_LOCK_FRAMES_BEFORE_COAST = 5   # spec: only trust the physics fallback after 5-10 real frames
 
 
 def get_video_meta(path: str) -> dict:
@@ -76,9 +75,14 @@ class TracerRenderer:
     def add_point(self, x: float, y: float):
         pt = (int(round(x)), int(round(y)))
         if self._last_point is not None:
+            # Only ever draw line SEGMENTS between successive points -- no
+            # standalone dot on the first point. A dot drawn at the very
+            # first point sits on the ball while it's still essentially at
+            # rest (the address/impact position), which reads as a blob
+            # stuck to the tee before the shot. Waiting for a second point
+            # means the tracer visibly begins only once the ball has
+            # actually moved -- i.e. as it starts flying.
             cv2.line(self.overlay, self._last_point, pt, self.color, self.thickness, lineType=cv2.LINE_AA)
-        else:
-            cv2.circle(self.overlay, pt, max(self.thickness // 2, 2), self.color, -1, lineType=cv2.LINE_AA)
         self._last_point = pt
 
     def render(self, frame: np.ndarray) -> np.ndarray:
@@ -138,7 +142,6 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
     path: List[Optional[Point2D]] = [None] * total_frames
     frame_idx = 0
     gap_start: Optional[int] = None
-    frames_locked_before_gap = 0
     last_good_point: Optional[Point2D] = None
     last_good_velocity: Optional[Tuple[float, float]] = None
     stopped_at_frame: Optional[int] = None
@@ -149,10 +152,6 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
             break
 
         if frame_idx < impact_frame_idx:
-            # Inpaint out the known resting-ball position before learning,
-            # so it never gets absorbed into the background model (see
-            # BallDetector.warm_up's docstring for why that matters).
-            detector.warm_up(frame, exclude_point=impact_xy)
             frame_idx += 1
             continue
 
@@ -166,8 +165,22 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
             continue
 
         predicted_xy = tracker.predict()
-        speed = float(np.hypot(*tracker.current_velocity))
-        search_radius = max(160.0, speed * 1.5)  # widen the search window for genuinely fast shots
+        if last_good_velocity is None:
+            # No real detection since impact yet, so there's no velocity
+            # estimate to size the search window from -- and the true
+            # moment of contact virtually never lines up exactly with a
+            # frame boundary. If impact actually happened a fraction of a
+            # frame before this one, the ball may already have covered a
+            # large distance by now (worse at 30fps than 60fps), and a
+            # search window sized for "presumably still near the impact
+            # point" would wrongly reject it. Search generously for this
+            # first attempt specifically; every attempt after this one has
+            # a real velocity estimate to size the window from instead.
+            h, w = frame.shape[:2]
+            search_radius = 0.5 * max(w, h)
+        else:
+            speed = float(np.hypot(*tracker.current_velocity))
+            search_radius = max(160.0, speed * 1.5)  # widen the window for genuinely fast shots
         measured_xy = detector.detect(frame, predicted_xy=predicted_xy, search_radius=search_radius)
 
         if measured_xy is not None:
@@ -175,30 +188,36 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
             path[frame_idx] = Point2D(*corrected_xy)
 
             if gap_start is not None:
-                if frames_locked_before_gap >= MIN_LOCK_FRAMES_BEFORE_COAST:
-                    gravity_px = max(tracker.current_acceleration[1], 4.0)
-                    gap_len = frame_idx - gap_start
-                    filled = gap_filler.fill_gap(
-                        p_start=last_good_point, v_start=last_good_velocity or (0.0, 0.0),
-                        n_frames=gap_len, p_end=path[frame_idx], gravity_px=gravity_px,
-                    )
-                    for i, pt in enumerate(filled):
-                        path[gap_start + i] = pt
+                # Fill the gap regardless of how "established" the track
+                # was beforehand. Even with a bare (or zero) velocity
+                # estimate, the ease-in correction in fill_gap guarantees
+                # the filled path lands exactly on this real re-acquisition
+                # point -- so a shakier initial guess just means the SHAPE
+                # of the fill is less refined, not that it ends up wrong.
+                # This matters a lot right after impact specifically: the
+                # clubhead/follow-through commonly occludes the ball for a
+                # handful of frames before a real lock is established, and
+                # treating that as an instant failure (the old behavior)
+                # was worse than a slightly-rougher gap-fill.
+                gravity_px = max(tracker.current_acceleration[1], 4.0)
+                gap_len = frame_idx - gap_start
+                filled = gap_filler.fill_gap(
+                    p_start=last_good_point, v_start=last_good_velocity or (0.0, 0.0),
+                    n_frames=gap_len, p_end=path[frame_idx], gravity_px=gravity_px,
+                )
+                for i, pt in enumerate(filled):
+                    path[gap_start + i] = pt
                 gap_start = None
 
             last_good_point = path[frame_idx]
             last_good_velocity = tracker.current_velocity
         else:
-            streak_before_miss = tracker.register_miss()
+            tracker.register_miss()
             if gap_start is None:
                 gap_start = frame_idx
-                frames_locked_before_gap = streak_before_miss
 
             gap_len = frame_idx - gap_start + 1
-            insufficient_lock = frames_locked_before_gap < MIN_LOCK_FRAMES_BEFORE_COAST
-            gap_too_long = gap_len > MAX_COAST_FRAMES
-
-            if insufficient_lock or gap_too_long:
+            if gap_len > MAX_COAST_FRAMES:
                 stopped_at_frame = gap_start
                 break
 
