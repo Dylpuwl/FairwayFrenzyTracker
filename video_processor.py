@@ -264,7 +264,20 @@ def _build_ball_path_auto(source_path: str, impact_frame_idx: int, impact_xy: Tu
             progress_callback(0.5 * frame_idx / total_frames)
 
     cap.release()
-    return path, stopped_at_frame
+    last_state = None
+    if last_good_point is not None:
+        last_state = {
+            "point": last_good_point,
+            "velocity": last_good_velocity or (0.0, 0.0),
+            "gravity_px": max(tracker.current_acceleration[1], 4.0),
+            "frame": None,
+        }
+        # Find the frame index of that last real detection.
+        for i in range(len(path) - 1, -1, -1):
+            if path[i] is not None:
+                last_state["frame"] = i
+                break
+    return path, stopped_at_frame, last_state
 
 
 def freeze_path_from(path: List[Optional[Point2D]], freeze_at_frame: int) -> List[Optional[Point2D]]:
@@ -321,13 +334,61 @@ def process_video_auto(source_path: str, output_path: str, impact_frame_idx: int
     """Fail-Safe 1 pipeline: live CV + Kalman tracking with physics-based
     gap fill. Returns either a finished output_path, or a request for the
     caller to resolve an early stop (see `freeze_path_from` / Fail-Safe 2)."""
-    path, stopped_at_frame = _build_ball_path_auto(source_path, impact_frame_idx, impact_xy, progress_callback)
+    path, stopped_at_frame, last_state = _build_ball_path_auto(
+        source_path, impact_frame_idx, impact_xy, progress_callback)
 
     if stopped_at_frame is not None:
-        return {"tracking_stopped": True, "stopped_at_frame": stopped_at_frame, "path_so_far": path}
+        return {"tracking_stopped": True, "stopped_at_frame": stopped_at_frame,
+                "path_so_far": path, "last_state": last_state}
 
     render_path_over_video(source_path, output_path, path, color_bgr, progress_callback)
     return {"tracking_stopped": False, "output_path": output_path}
+
+
+def extrapolate_lost_flight(source_path: str, output_path: str,
+                             path_so_far: List[Optional[Point2D]], last_state: dict,
+                             color_bgr: Tuple[int, int, int], progress_callback=None) -> None:
+    """
+    Request #2: when the ball is genuinely lost mid-flight, continue the
+    tracer with the best PHYSICS ESTIMATE of where it would go, instead of
+    stopping or forcing manual tapping.
+
+    Simulates forward from the last confidently-known position + velocity
+    (gravity + drag + a little lift, same model used for gap-filling) and
+    keeps drawing until the estimated ball would leave the frame or we run
+    out of clip. The drawn continuation is a genuine estimate, not measured
+    truth -- it reflects the ball's established trajectory at the moment
+    tracking lost it, which is the most defensible guess available from a
+    single camera.
+    """
+    meta = get_video_meta(source_path)
+    w, h = meta["width"], meta["height"]
+    total_frames = meta["frame_count"]
+
+    path = list(path_so_far)
+    start_frame = last_state["frame"]
+    if start_frame is None:
+        # Nothing was ever tracked -- nothing to extrapolate from.
+        render_path_over_video(source_path, output_path, path, color_bgr, progress_callback)
+        return
+
+    n_remaining = total_frames - start_frame - 1
+    if n_remaining > 0:
+        filler = ProjectileGapFiller()
+        estimated = filler.fill_gap(
+            p_start=last_state["point"], v_start=last_state["velocity"],
+            n_frames=n_remaining, p_end=None, gravity_px=last_state["gravity_px"],
+        )
+        for i, pt in enumerate(estimated):
+            idx = start_frame + 1 + i
+            if idx >= total_frames:
+                break
+            # Stop drawing once the estimate leaves the visible frame.
+            if pt.x < 0 or pt.x > w or pt.y < 0 or pt.y > h:
+                break
+            path[idx] = pt
+
+    render_path_over_video(source_path, output_path, path, color_bgr, progress_callback)
 
 
 def process_video_manual(source_path: str, output_path: str,

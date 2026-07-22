@@ -30,6 +30,7 @@ from video_processor import (
     process_video_manual,
     render_path_over_video,
     freeze_path_from,
+    extrapolate_lost_flight,
 )
 from impact_detection import detect_impact_frame
 
@@ -124,12 +125,12 @@ def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
 
     col_prev, col_slider, col_next = st.columns([1, 8, 1])
     with col_prev:
-        st.button("◀", key="impact_prev", on_click=_step_impact, args=(-1,), use_container_width=True)
+        st.button("◀", key="impact_prev", on_click=_step_impact, args=(-1,), width="stretch")
     with col_slider:
         idx = st.slider("Scrub to the impact frame", 0, n_frames - 1, key="impact_slider",
                          label_visibility="collapsed")
     with col_next:
-        st.button("▶", key="impact_next", on_click=_step_impact, args=(1,), use_container_width=True)
+        st.button("▶", key="impact_next", on_click=_step_impact, args=(1,), width="stretch")
 
     # Key includes the frame index on purpose: streamlit_image_coordinates
     # keeps returning its LAST value across reruns, so without this, moving
@@ -168,6 +169,7 @@ def impact_picker_fragment(video_path, frames, scale, n_frames, color_bgr):
             if result["tracking_stopped"]:
                 st.session_state.path_so_far = result["path_so_far"]
                 st.session_state.stopped_at_frame = result["stopped_at_frame"]
+                st.session_state.last_state = result.get("last_state")
                 st.session_state.mode = "confirm_stop"
             else:
                 st.session_state.output_path = result["output_path"]
@@ -225,11 +227,11 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
 
     col_prev, col_slider, col_next = st.columns([1, 8, 1])
     with col_prev:
-        st.button("◀", key=f"prev_{active}", on_click=_step_point, args=(-1,), use_container_width=True)
+        st.button("◀", key=f"prev_{active}", on_click=_step_point, args=(-1,), width="stretch")
     with col_slider:
         idx = st.slider("Scrub", 0, n_frames - 1, key=slider_key, label_visibility="collapsed")
     with col_next:
-        st.button("▶", key=f"next_{active}", on_click=_step_point, args=(1,), use_container_width=True)
+        st.button("▶", key=f"next_{active}", on_click=_step_point, args=(1,), width="stretch")
 
     coords = streamlit_image_coordinates(frames[idx], key=f"click_{active}_{idx}")
     if coords is not None:
@@ -251,7 +253,7 @@ def manual_picker_fragment(frames, scale, n_frames, color_bgr, video_path):
         recols = st.columns(len(set_points))
         for col, p in zip(recols, set_points):
             with col:
-                if st.button(f"Edit {p.title()}", key=f"edit_{p}", use_container_width=True):
+                if st.button(f"Edit {p.title()}", key=f"edit_{p}", width="stretch"):
                     st.session_state.manual_active_point = p
                     st.rerun(scope="fragment")
 
@@ -323,21 +325,45 @@ if mode == "auto_pick_impact":
 elif mode == "confirm_stop":
     stopped_at = st.session_state.stopped_at_frame
     meta = get_video_meta(st.session_state.video_path)
-    timestamp = stopped_at / meta["fps"] if meta["fps"] else 0.0
+    fps = meta["fps"] or 30.0
+    timestamp = stopped_at / fps
     st.warning(
         f"Automatic tracking stopped at frame {stopped_at} (about {timestamp:.1f} seconds into the clip). "
         f"This can mean the ball simply left the frame or landed (normal end of shot), "
         f"or that tracking lost it (clouds, motion blur, low contrast, etc)."
     )
-    # Show the actual frame so "frame 657" is something you can SEE, not
-    # just a number -- you can tell at a glance whether the ball had really
-    # left/landed there, or whether tracking lost it mid-flight.
-    if 0 <= stopped_at < len(frames):
-        st.image(frames[stopped_at], caption=f"This is frame {stopped_at} — where tracking stopped.",
-                 use_container_width=True)
+    # Show the actual frame so "frame 657" is something you can SEE. Clamp
+    # the index: stopped_at counts full-video frames, and the preview list
+    # can differ in length, so an unclamped lookup here can crash.
+    if frames:
+        preview_idx = max(0, min(stopped_at, len(frames) - 1))
+        st.image(frames[preview_idx],
+                 caption=f"This is frame {stopped_at} — where tracking stopped.",
+                 width="stretch")
+
+    have_state = st.session_state.get("last_state") is not None
+
+    st.markdown("**What would you like to do?**")
+    if st.button("🎯 Estimate the rest of the flight (recommended)", type="primary",
+                 disabled=not have_state):
+        progress = st.progress(0.0, text="Estimating flight path…")
+        out_dir = tempfile.mkdtemp()
+        out_path = os.path.join(out_dir, "tracer_output.mp4")
+        extrapolate_lost_flight(
+            st.session_state.video_path, out_path,
+            st.session_state.path_so_far, st.session_state.last_state, color_bgr,
+            progress_callback=lambda p: progress.progress(min(p, 1.0), text="Estimating flight path…"),
+        )
+        st.session_state.output_path = out_path
+        st.session_state.mode = "done"
+        st.rerun()
+    if not have_state:
+        st.caption("Estimate unavailable — the ball was never tracked long enough to project a path. "
+                   "Use manual mode below.")
+
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("✅ That's the end of the shot — finish"):
+        if st.button("✅ Stop the tracer here (ball landed / left frame)"):
             progress = st.progress(0.0, text="Rendering…")
             out_dir = tempfile.mkdtemp()
             out_path = os.path.join(out_dir, "tracer_output.mp4")
@@ -350,7 +376,7 @@ elif mode == "confirm_stop":
             st.session_state.mode = "done"
             st.rerun()
     with c2:
-        if st.button("❌ It lost the ball — use manual mode"):
+        if st.button("✏️ Draw it myself (manual mode)"):
             st.session_state.mode = "manual_pick_points"
             st.rerun()
 
